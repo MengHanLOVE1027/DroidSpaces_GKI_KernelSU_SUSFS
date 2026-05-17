@@ -1,4 +1,4 @@
-name: 内核构建流程
+name: 内核源码拉取与发布
 
 permissions:
   contents: write
@@ -7,7 +7,6 @@ permissions:
 on:
   workflow_call:
     inputs:
-      # ==================== 基础配置 ====================
       android_version:
         required: true
         type: string
@@ -22,27 +21,21 @@ on:
         type: string
 
 jobs:
-  build-kernel:
-    name: "${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ inputs.ksu_variant }}"
+  publish-source:
+    name: "发布源码 ${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }}"
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
-    env:
-      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
-      CCACHE_NOHASHDIR: "true"
-      CCACHE_HARDLINK: "true"
-
     steps:
-      - name: 构建信息摘要
+      - name: 打印配置摘要
         run: |
           echo "========================================"
-          echo "       内核拉取配置摘要"
+          echo "       内核源码拉取配置"
           echo "========================================"
           echo "Android 版本  : ${{ inputs.android_version }}"
           echo "内核版本      : ${{ inputs.kernel_version }}"
           echo "子版本号      : ${{ inputs.sub_level }}"
           echo "补丁级别      : ${{ inputs.os_patch_level }}"
-          echo "构建时间      : ${{ inputs.build_time }}"
           echo "========================================"
 
       - name: 清理磁盘空间
@@ -60,10 +53,10 @@ jobs:
           rmz_version: "3.1.1"
           testing: false
 
-      - name: 检出代码仓库
+      - name: 检出代码仓库（如需自定义补丁等可保留）
         uses: actions/checkout@v6
 
-      - name: 初始化构建环境
+      - name: 初始化目录与环境变量
         run: |
           CONFIG="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}"
           KERNEL_ROOT="$GITHUB_WORKSPACE/$CONFIG"
@@ -72,17 +65,6 @@ jobs:
           cat >> $GITHUB_ENV << EOF
           CONFIG=$CONFIG
           KERNEL_ROOT=$KERNEL_ROOT
-          DEFCONFIG=$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig
-          SUSFS4KSU=$GITHUB_WORKSPACE/susfs4ksu
-          KERNEL_PATCHES=$GITHUB_WORKSPACE/kernel_patches
-          SUKISU_PATCHES=$GITHUB_WORKSPACE/SukiSU_patch
-          ZZH_PATCHES=$GITHUB_WORKSPACE
-          ANYKERNEL3=$GITHUB_WORKSPACE/AnyKernel3
-          ACTION_BUILD=$GITHUB_WORKSPACE/Action-Build
-          AVBTOOL=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin/avbtool
-          MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py
-          UNPACK_BOOTIMG=$GITHUB_WORKSPACE/mkbootimg/unpack_bootimg.py
-          BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem
           EOF
 
           mkdir -p "$GITHUB_WORKSPACE/git-repo"
@@ -91,66 +73,14 @@ jobs:
           echo "$GITHUB_WORKSPACE/git-repo" >> "$GITHUB_PATH"
           echo "REPO=$GITHUB_WORKSPACE/git-repo/repo" >> $GITHUB_ENV
 
-      - name: 显示配置信息
-        run: |
-          CONFIG_FILE="$GITHUB_WORKSPACE/config/config"
-          if [ -f "$CONFIG_FILE" ]; then
-            echo "加载配置文件: $CONFIG_FILE"
-            cat "$CONFIG_FILE"
-          fi
-
-      - name: 安装编译依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves
-
-      - name: 配置 ccache
-        run: |
-          mkdir -p ~/.cache/bazel
-          ccache --version
-          ccache --max-size=2G
-          ccache --set-config=compression=true
-          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
-
-      - name: 恢复 ccache 缓存
-        uses: actions/cache@v5
-        with:
-          path: ~/.ccache
-          key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-ccache-${{ github.sha }}
-          restore-keys: |
-            ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-ccache-
-
-      - name: 缓存工具链
-        id: cache-toolchain
-        uses: actions/cache@v5
-        with:
-          path: |
-            kernel-build-tools
-            mkbootimg
-          key: toolchain-${{ runner.os }}-v1
-
-      - name: 下载工具链
-        if: steps.cache-toolchain.outputs.cache-hit != 'true'
-        run: |
-          AOSP_MIRROR=https://android.googlesource.com
-          BRANCH=main-kernel-build-2024
-          git clone $AOSP_MIRROR/kernel/prebuilts/build-tools -b $BRANCH --depth 1 kernel-build-tools
-          git clone $AOSP_MIRROR/platform/system/tools/mkbootimg -b $BRANCH --depth 1 mkbootimg
-
-      - name: 生成签名密钥
-        run: |
-          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 > $BOOT_SIGN_KEY_PATH
-
       - name: 配置 Git
         run: |
           git config --global user.name "BuildBot"
           git config --global user.email "BuildGkiKernel@gmail.com"
 
-      - name: 初始化并同步内核源码
+      - name: 同步内核源码
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
-          git clone https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git gcc
-
           FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
           echo "初始化 repo，分支: common-${FORMATTED_BRANCH}"
 
@@ -159,14 +89,12 @@ jobs:
           REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${FORMATTED_BRANCH})
           DEFAULT_MANIFEST_PATH=.repo/manifests/default.xml
 
-          if grep -q deprecated <<< $REMOTE_BRANCH; then
-            echo "检测到已弃用的分支: $FORMATTED_BRANCH"
+          if grep -q deprecated <<< "$REMOTE_BRANCH"; then
+            echo "检测到已弃用的分支，调整 manifest"
             sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" $DEFAULT_MANIFEST_PATH
           fi
 
           $REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast
-          echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> $GITHUB_ENV
-
 
       - name: 提取实际子版本号
         run: |
@@ -176,50 +104,31 @@ jobs:
             [[ -n "$EXTRACTED" ]] && ACTUAL_SUBLEVEL="$EXTRACTED"
           fi
           echo "ACTUAL_SUBLEVEL=$ACTUAL_SUBLEVEL" >> $GITHUB_ENV
-          echo "实际子版本号: $ACTUAL_SUBLEVEL"
+          # 使用实际子版本更新压缩包名标识
+          REAL_CONFIG="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${ACTUAL_SUBLEVEL}"
+          echo "REAL_CONFIG=$REAL_CONFIG" >> $GITHUB_ENV
+          echo "实际子版本号: $ACTUAL_SUBLEVEL → 配置标识: $REAL_CONFIG"
 
-      - name: 修复 glibc 2.38 兼容性
-        working-directory: ${{ env.KERNEL_ROOT }}/common
+      - name: 压缩内核源码
         run: |
-          RAW_SUB="${{ inputs.sub_level }}"
-          [[ ! "$RAW_SUB" =~ ^[0-9]+$ ]] && CURRENT_SUB=99999 || CURRENT_SUB=$RAW_SUB
+          ARCHIVE_NAME="kernel-source-${{ env.REAL_CONFIG }}.tar.gz"
+          echo "正在压缩 $KERNEL_ROOT 至 $ARCHIVE_NAME （排除 .repo 目录）"
+          tar -czf "$GITHUB_WORKSPACE/$ARCHIVE_NAME" \
+            -C "$KERNEL_ROOT" \
+            --exclude='.repo' \
+            .
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+          echo "压缩完成：$(du -sh $GITHUB_WORKSPACE/$ARCHIVE_NAME | cut -f1)"
 
-          NEEDS_FIX=false
-          if [[ "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.10" && $CURRENT_SUB -le 186 ]] ||
-             [[ "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.15" && $CURRENT_SUB -le 119 ]] ||
-             [[ "${{ inputs.android_version }}" == "android14" && "${{ inputs.kernel_version }}" == "6.1" && $CURRENT_SUB -le 43 ]]; then
-            NEEDS_FIX=true
-          fi
-
-          if [ "$NEEDS_FIX" = true ]; then
-            GLIBC_VERSION=$(ldd --version 2>/dev/null | head -n 1 | awk '{print $NF}')
-            if [ "$(printf '%s\n' "2.38" "$GLIBC_VERSION" | sort -V | head -n1)" = "2.38" ]; then
-              echo "应用 glibc 2.38 兼容性修复..."
-              sed -i '/\$(Q)\$(MAKE) -C \$(SUBCMD_SRC) OUTPUT=\$(abspath \$(dir \$@))\/ \$(abspath \$@)/s//$(Q)$(MAKE) -C $(SUBCMD_SRC) EXTRA_CFLAGS="$(CFLAGS)" OUTPUT=$(abspath $(dir $@))\/ $(abspath $@)/' tools/bpf/resolve_btfids/Makefile 2>/dev/null || true
-
-              if [[ "${{ inputs.kernel_version }}" == "5.10" || "${{ inputs.kernel_version }}" == "5.15" ]]; then
-                sed -i '/char \*buf = NULL;/a int i;' tools/lib/subcmd/parse-options.c 2>/dev/null || true
-                sed -i 's/for (int i = 0; subcommands\[i\]; i++) {/for (i = 0; subcommands[i]; i++) {/' tools/lib/subcmd/parse-options.c 2>/dev/null || true
-                sed -i '/if (subcommands) {/a int i;' tools/lib/subcmd/parse-options.c 2>/dev/null || true
-                sed -i 's/for (int i = 0; subcommands\[i\]; i++)/for (i = 0; subcommands[i]; i++)/' tools/lib/subcmd/parse-options.c 2>/dev/null || true
-              fi
-            fi
-          fi
-
-      - name: 上传构建产物
-        uses: actions/upload-artifact@v6
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}
-          path: |
-            *AnyKernel3.zip
-            *.img
-          compression-level: 9
-
-      - name: 上传补丁冲突文件
-        if: always() && env.REJ_COUNT > 0
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}-Rejects
-          path: patch-rejects/
-          if-no-files-found: ignore
-          compression-level: 9
+          tag_name: "${{ env.REAL_CONFIG }}-${{ github.run_number }}"
+          name: "内核源码 ${{ env.REAL_CONFIG }}"
+          body: |
+            - Android 版本: ${{ inputs.android_version }}
+            - 内核版本: ${{ inputs.kernel_version }}
+            - 子版本号: ${{ env.ACTUAL_SUBLEVEL }}
+            - 补丁级别: ${{ inputs.os_patch_level }}
+            - 分支: common-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}
+          files: "${{ env.ARCHIVE_NAME }}"
