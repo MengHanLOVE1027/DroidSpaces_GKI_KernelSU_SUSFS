@@ -109,26 +109,38 @@ jobs:
           echo "REAL_CONFIG=$REAL_CONFIG" >> $GITHUB_ENV
           echo "实际子版本号: $ACTUAL_SUBLEVEL → 配置标识: $REAL_CONFIG"
 
-      - name: 压缩内核源码
+      - name: 分卷压缩内核源码
         run: |
-          ARCHIVE_NAME="kernel-source-${{ env.REAL_CONFIG }}.tar.gz"
-          echo "正在压缩 $KERNEL_ROOT 至 $ARCHIVE_NAME （排除 .repo 目录）"
-          tar -czf "$GITHUB_WORKSPACE/$ARCHIVE_NAME" \
-            -C "$KERNEL_ROOT" \
-            --exclude='.repo' \
-            .
-          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
-          echo "压缩完成：$(du -sh $GITHUB_WORKSPACE/$ARCHIVE_NAME | cut -f1)"
+          ARCHIVE_BASE="kernel-source-${{ env.REAL_CONFIG }}.tar.gz"
+          echo "压缩 $KERNEL_ROOT 到分卷，排除 .repo 目录"
+          # 先创建完整压缩包，并管道到 split 分卷，每个分卷最大 2GB（2000M 留有余量）
+          tar czf - -C "$KERNEL_ROOT" --exclude='.repo' . | split -b 2000M - "$GITHUB_WORKSPACE/$ARCHIVE_BASE.part"
+          echo "分卷列表："
+          ls -lh "$GITHUB_WORKSPACE/$ARCHIVE_BASE.part"*
+          # 生成 SHA256 校验文件
+          cd "$GITHUB_WORKSPACE"
+          sha256sum $ARCHIVE_BASE.part* > "$ARCHIVE_BASE.sha256"
+          echo "ARCHIVE_BASE=$ARCHIVE_BASE" >> $GITHUB_ENV
 
-      - name: 发布到 GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "${{ env.REAL_CONFIG }}-${{ github.run_number }}"
-          name: "内核源码 ${{ env.REAL_CONFIG }}"
-          body: |
-            - Android 版本: ${{ inputs.android_version }}
-            - 内核版本: ${{ inputs.kernel_version }}
-            - 子版本号: ${{ env.ACTUAL_SUBLEVEL }}
-            - 补丁级别: ${{ inputs.os_patch_level }}
-            - 分支: common-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}
-          files: "${{ env.ARCHIVE_NAME }}"
+      - name: 创建 Release 并上传分卷
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARCHIVE_BASE="${{ env.ARCHIVE_BASE }}"
+          TAG="${{ env.REAL_CONFIG }}-${{ github.run_number }}"
+
+          echo "创建 Release 标签 $TAG"
+          gh release create "$TAG" \
+            --title "内核源码 ${{ env.REAL_CONFIG }}" \
+            --notes "- Android: ${{ inputs.android_version }}
+          - 内核: ${{ inputs.kernel_version }}
+          - 子版本: ${{ env.ACTUAL_SUBLEVEL }}
+          - 补丁: ${{ inputs.os_patch_level }}
+          - 分支: common-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}" \
+          || true   # 如果标签已存在（重试场景），不会报错
+
+          # 上传所有分卷及校验文件
+          for f in $GITHUB_WORKSPACE/$ARCHIVE_BASE.part* $GITHUB_WORKSPACE/$ARCHIVE_BASE.sha256; do
+            echo "上传 $f"
+            gh release upload "$TAG" "$f"
+          done
